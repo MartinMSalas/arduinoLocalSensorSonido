@@ -1,9 +1,22 @@
-const byte LED_PIN = LED_BUILTIN;
-const byte MIC_PIN = A0;
+#include <SPI.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <math.h>
 
 // =====================================
-// MAQUINA DE ESTADOS DEL LED
+// DISPLAY MAX7219 FC-16
 // =====================================
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 1
+#define CS_PIN 53
+
+MD_Parola display = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+
+// =====================================
+// LED ONBOARD - MAQUINA DE ESTADOS
+// =====================================
+const byte LED_PIN = LED_BUILTIN;
+
 const unsigned long DURACION_ESTADO_LED = 2000;
 const unsigned long INTERVALO_LENTO = 500;
 const unsigned long INTERVALO_RAPIDO = 150;
@@ -16,31 +29,38 @@ enum EstadoLED {
 };
 
 EstadoLED estadoLED = PARPADEO_LENTO;
-
 unsigned long tiempoCambioEstadoLED = 0;
 unsigned long tiempoUltimoParpadeo = 0;
 bool ledEstadoFisico = LOW;
 
 // =====================================
-// CONFIG AUDIO
+// MICROFONO / ANALISIS
 // =====================================
-const unsigned long REPORT_MS = 10000;
-const unsigned long PEAK_WINDOW_MS = 20;
+const byte MIC_PIN = A0;
+const unsigned long REPORT_MS = 10000;   // RMS promedio cada 10 segundos
 const int BLOCK_SIZE = 200;
 
-// Escala para porcentaje de pico útil
-const float PICO_REFERENCIA_MAX = 170.0;
-
-// Calibración inicial de ruido
+// =====================================
+// CALIBRACION INICIAL
+// =====================================
 const unsigned long CALIBRATION_MS = 8000;
 bool calibrando = true;
 unsigned long calibrationStart = 0;
 
-// margen extra por encima del ruido base
-const float MARGEN_RUIDO = 15.0;
+// valores base aprendidos al inicio
+double centroBase = 0.0;
+double rmsBase = 0.0;
+double picoBase = 0.0;
+
+// acumuladores para calibracion
+unsigned long calibSamples = 0;
+double calibSum = 0.0;
+double calibSumSquaresCentered = 0.0;
+int calibMin = 1023;
+int calibMax = 0;
 
 // =====================================
-// ACUMULADORES GENERALES
+// ACUMULADORES DE MEDICION NORMAL
 // =====================================
 unsigned long lastReport = 0;
 
@@ -54,25 +74,8 @@ int globalMax = 0;
 int buffer[BLOCK_SIZE];
 int bufferIndex = 0;
 
-// =====================================
-// PICOS CORTOS
-// =====================================
-unsigned long peakWindowStart = 0;
-int peakMin = 1023;
-int peakMax = 0;
-
-// top 3 picos útiles del período
-float topPeak1 = 0.0;
-float topPeak2 = 0.0;
-float topPeak3 = 0.0;
-
-// =====================================
-// CALIBRACION DE RUIDO
-// =====================================
-float ruidoBase = 0.0;
-float sumaPicosCalibracion = 0.0;
-unsigned long cantidadPicosCalibracion = 0;
-float picoMaxCalibracion = 0.0;
+// Texto del display
+char textoDisplay[16] = "CAL";
 
 // =====================================
 // SETUP
@@ -83,14 +86,19 @@ void setup() {
 
   Serial.begin(115200);
 
+  // Display
+  display.begin();
+  display.setIntensity(2);   // 0..15
+  display.displayClear();
+  display.displayText(textoDisplay, PA_CENTER, 60, 500, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+
   unsigned long ahora = millis();
   tiempoCambioEstadoLED = ahora;
   tiempoUltimoParpadeo = ahora;
   lastReport = ahora;
-  peakWindowStart = ahora;
   calibrationStart = ahora;
 
-  Serial.println("Iniciando calibracion de ruido... dejar en silencio.");
+  Serial.println("Iniciando calibracion de base... mantener en silencio relativo.");
 }
 
 // =====================================
@@ -100,17 +108,22 @@ void loop() {
   unsigned long ahora = millis();
 
   actualizarMaquinaEstadosLED(ahora);
-  capturarAudio(ahora);
+  capturarAudio();
 
   if (calibrando) {
     procesarCalibracionSiCorresponde(ahora);
   } else {
     reportarAudioSiCorresponde(ahora);
   }
+
+  // animacion del display sin bloquear
+  if (display.displayAnimate()) {
+    display.displayReset();
+  }
 }
 
 // =====================================
-// LED
+// LED FSM
 // =====================================
 void actualizarMaquinaEstadosLED(unsigned long ahora) {
   switch (estadoLED) {
@@ -168,42 +181,58 @@ void cambiarEstadoLED() {
 }
 
 // =====================================
-// AUDIO
+// CAPTURA DE AUDIO
 // =====================================
-void capturarAudio(unsigned long ahora) {
+void capturarAudio() {
   int raw = analogRead(MIC_PIN);
 
-  // estadísticas generales
   buffer[bufferIndex++] = raw;
+
   if (bufferIndex >= BLOCK_SIZE) {
-    procesarBloque();
-  }
-
-  // ventana corta para picos
-  if (raw < peakMin) peakMin = raw;
-  if (raw > peakMax) peakMax = raw;
-
-  if (ahora - peakWindowStart >= PEAK_WINDOW_MS) {
-    float picoVentana = (peakMax - peakMin) / 2.0;
-
     if (calibrando) {
-      sumaPicosCalibracion += picoVentana;
-      cantidadPicosCalibracion++;
-      if (picoVentana > picoMaxCalibracion) {
-        picoMaxCalibracion = picoVentana;
-      }
+      procesarBloqueCalibracion();
     } else {
-      float picoFiltrado = filtrarRuidoPico(picoVentana);
-      actualizarTop3Picos(picoFiltrado);
+      procesarBloqueNormal();
     }
-
-    peakMin = 1023;
-    peakMax = 0;
-    peakWindowStart = ahora;
   }
 }
 
-void procesarBloque() {
+// =====================================
+// BLOQUE DE CALIBRACION
+// =====================================
+void procesarBloqueCalibracion() {
+  if (bufferIndex == 0) return;
+
+  double blockSum = 0.0;
+  int blockMin = 1023;
+  int blockMax = 0;
+
+  for (int i = 0; i < bufferIndex; i++) {
+    blockSum += buffer[i];
+    if (buffer[i] < blockMin) blockMin = buffer[i];
+    if (buffer[i] > blockMax) blockMax = buffer[i];
+  }
+
+  double blockMean = blockSum / bufferIndex;
+
+  for (int i = 0; i < bufferIndex; i++) {
+    double centered = buffer[i] - blockMean;
+    calibSumSquaresCentered += centered * centered;
+  }
+
+  calibSamples += bufferIndex;
+  calibSum += blockSum;
+
+  if (blockMin < calibMin) calibMin = blockMin;
+  if (blockMax > calibMax) calibMax = blockMax;
+
+  bufferIndex = 0;
+}
+
+// =====================================
+// BLOQUE NORMAL
+// =====================================
+void procesarBloqueNormal() {
   if (bufferIndex == 0) return;
 
   double blockSum = 0.0;
@@ -233,67 +262,46 @@ void procesarBloque() {
 }
 
 // =====================================
-// CALIBRACION
+// FIN DE CALIBRACION
 // =====================================
 void procesarCalibracionSiCorresponde(unsigned long ahora) {
   if (ahora - calibrationStart >= CALIBRATION_MS) {
-    if (cantidadPicosCalibracion > 0) {
-      float promedioCalibracion = sumaPicosCalibracion / cantidadPicosCalibracion;
+    procesarBloqueCalibracion();
 
-      // combinación conservadora:
-      // ruido base = promedio + una parte del máximo observado
-      ruidoBase = promedioCalibracion + ((picoMaxCalibracion - promedioCalibracion) * 0.5);
+    if (calibSamples > 0) {
+      centroBase = calibSum / calibSamples;
+      rmsBase = sqrt(calibSumSquaresCentered / calibSamples);
+      picoBase = (calibMax - calibMin) / 2.0;
     } else {
-      ruidoBase = 30.0;
+      centroBase = 512.0;
+      rmsBase = 0.0;
+      picoBase = 0.0;
     }
 
     calibrando = false;
-    resetAudio(ahora);
+    resetMedicionNormal();
+    lastReport = ahora;
 
-    Serial.print("Calibracion finalizada. RUIDO_BASE=");
-    Serial.print(ruidoBase, 2);
-    Serial.print("  UMBRAL=");
-    Serial.println(ruidoBase + MARGEN_RUIDO, 2);
+    Serial.println("Calibracion finalizada.");
+    Serial.print("CentroBase=");
+    Serial.print(centroBase, 2);
+    Serial.print("  RMSBase=");
+    Serial.print(rmsBase, 2);
+    Serial.print("  PicoBase=");
+    Serial.println(picoBase, 2);
+
+    snprintf(textoDisplay, sizeof(textoDisplay), "OK");
+    display.displayClear();
+    display.displayText(textoDisplay, PA_CENTER, 60, 500, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
   }
 }
 
 // =====================================
-// FILTRO DE RUIDO
-// =====================================
-float filtrarRuidoPico(float picoBruto) {
-  float umbral = ruidoBase + MARGEN_RUIDO;
-
-  if (picoBruto <= umbral) {
-    return 0.0;
-  }
-
-  return picoBruto - umbral;
-}
-
-// =====================================
-// TOP 3 PICOS
-// =====================================
-void actualizarTop3Picos(float nuevoPico) {
-  if (nuevoPico <= 0.0) return;
-
-  if (nuevoPico > topPeak1) {
-    topPeak3 = topPeak2;
-    topPeak2 = topPeak1;
-    topPeak1 = nuevoPico;
-  } else if (nuevoPico > topPeak2) {
-    topPeak3 = topPeak2;
-    topPeak2 = nuevoPico;
-  } else if (nuevoPico > topPeak3) {
-    topPeak3 = nuevoPico;
-  }
-}
-
-// =====================================
-// REPORTE
+// REPORTE NORMAL CADA 10s
 // =====================================
 void reportarAudioSiCorresponde(unsigned long ahora) {
   if (ahora - lastReport >= REPORT_MS) {
-    procesarBloque();
+    procesarBloqueNormal();
 
     if (totalSamples > 0) {
       double center = totalSum / totalSamples;
@@ -301,9 +309,12 @@ void reportarAudioSiCorresponde(unsigned long ahora) {
       double peakToPeak = globalMax - globalMin;
       double peak = peakToPeak / 2.0;
 
-      float porcentajePico = (topPeak1 / PICO_REFERENCIA_MAX) * 100.0;
-      if (porcentajePico > 100.0) porcentajePico = 100.0;
-      if (porcentajePico < 0.0) porcentajePico = 0.0;
+      double rmsDelta = rms - rmsBase;
+      double peakDelta = peak - picoBase;
+      double centerDelta = center - centroBase;
+
+      if (rmsDelta < 0) rmsDelta = 0;
+      if (peakDelta < 0) peakDelta = 0;
 
       Serial.print("LED=");
       Serial.print(nombreEstadoLED());
@@ -311,54 +322,55 @@ void reportarAudioSiCorresponde(unsigned long ahora) {
       Serial.print("  Centro=");
       Serial.print(center, 2);
 
+      Serial.print("  CentroBase=");
+      Serial.print(centroBase, 2);
+
+      Serial.print("  CentroDelta=");
+      Serial.print(centerDelta, 2);
+
       Serial.print("  P2P=");
       Serial.print(peakToPeak, 2);
 
       Serial.print("  Pico=");
       Serial.print(peak, 2);
 
+      Serial.print("  PicoBase=");
+      Serial.print(picoBase, 2);
+
+      Serial.print("  PicoDelta=");
+      Serial.print(peakDelta, 2);
+
       Serial.print("  RMS_PROM=");
       Serial.print(rms, 2);
 
-      Serial.print("  RUIDO_BASE=");
-      Serial.print(ruidoBase, 2);
+      Serial.print("  RMSBase=");
+      Serial.print(rmsBase, 2);
 
-      Serial.print("  PICO1_F=");
-      Serial.print(topPeak1, 2);
+      Serial.print("  RMSDelta=");
+      Serial.println(rmsDelta, 2);
 
-      Serial.print("  PICO2_F=");
-      Serial.print(topPeak2, 2);
+      // Mostrar RMS entero en display
+      int rmsEntero = (int)round(rms);
+      snprintf(textoDisplay, sizeof(textoDisplay), "R%d", rmsEntero);
 
-      Serial.print("  PICO3_F=");
-      Serial.print(topPeak3, 2);
-
-      Serial.print("  PICO_%=");
-      Serial.println(porcentajePico, 2);
-    } else {
-      Serial.print("LED=");
-      Serial.print(nombreEstadoLED());
-      Serial.println("  Sin muestras");
+      display.displayClear();
+      display.displayText(textoDisplay, PA_CENTER, 60, 500, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
     }
 
-    resetAudio(ahora);
+    resetMedicionNormal();
     lastReport = ahora;
   }
 }
 
-void resetAudio(unsigned long ahora) {
+// =====================================
+// RESET MEDICION NORMAL
+// =====================================
+void resetMedicionNormal() {
   totalSamples = 0;
   totalSum = 0.0;
   totalSumSquaresCentered = 0.0;
   globalMin = 1023;
   globalMax = 0;
-
-  topPeak1 = 0.0;
-  topPeak2 = 0.0;
-  topPeak3 = 0.0;
-
-  peakMin = 1023;
-  peakMax = 0;
-  peakWindowStart = ahora;
   bufferIndex = 0;
 }
 
